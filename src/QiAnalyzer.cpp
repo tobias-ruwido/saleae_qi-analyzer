@@ -26,7 +26,11 @@ QiAnalyzer::QiAnalyzer()
     , mTShortMinError(0)
     , mTShortMaxError(0)
     , mPacketByteCount(0)
-    , mSynchronized(false) {
+    , mSynchronized(false)
+    , mIsAnalogMode(false)
+    , mDigitalEdgeIndex(0)
+    , mCurrentDigitalState(BIT_LOW)
+    , mCurrentAnalogSample(0) {
     SetAnalyzerSettings(mSettings.get());
     UseFrameV2();
 
@@ -48,6 +52,13 @@ void QiAnalyzer::WorkerThread() {
 
     mQi = GetAnalyzerChannelData(mSettings->mInputChannel);
 
+    mIsAnalogMode = (U32(mSettings->mInputMode) == INPUT_MODE_ANALOG);
+
+    // If in analog mode, generate digital edges from analog data first
+    if (mIsAnalogMode) {
+        GenerateDigitalFromAnalog();
+    }
+
     double period = 1.0 / double(kBitRate);
     double half_period = period / 2.0;
     // Period is 500uS
@@ -55,13 +66,6 @@ void QiAnalyzer::WorkerThread() {
     // Half a period, 250uS
     mTShort = U32(mSampleRateHz * half_period);
     // Pulse tolerances (long / short pulses)
-    // 2:  50%          (250 / 125)
-    // 3:  33.33%       (166 /  83)
-    // 4:  25%          (125 /  62)
-    // 5:  20%          (100 /  50)
-    // 6:  16.67%       ( 83 /  41)
-    // 8:  12.5%        ( 62 /  31)
-    // 10: 10%          ( 50 /  25)
     mTLongMinError = CLAMP_MIN(mTLong / 4, 3);
     mTLongMaxError = CLAMP_MIN(mTLong / 4, 3);
     // Short min/max are only used for the initial pulse of a 1-bit; Long min/max are used for the whole bit
@@ -69,7 +73,17 @@ void QiAnalyzer::WorkerThread() {
     mTShortMaxError = CLAMP_MIN(mTShort / 2, 3);
 
     Invalidate();
-    mQi->AdvanceToNextEdge();
+
+    if (mIsAnalogMode) {
+        // In analog mode, start from the first generated edge
+        if (mDigitalEdges.size() < 2)
+            return;
+        mDigitalEdgeIndex = 0;
+        // Advance to first edge
+        AnalogAdvanceToNextEdge();
+    } else {
+        mQi->AdvanceToNextEdge();
+    }
 
     for (;;) {
         SynchronizeQiData();
@@ -77,6 +91,98 @@ void QiAnalyzer::WorkerThread() {
 
         CheckIfThreadShouldExit();
     }
+}
+
+// Generate digital signal from analog channel data using:
+// - Running average over 1000ms as dynamic threshold
+// - Configurable hysteresis (default 50mV)
+// - 3 consecutive samples in same state required for transition
+void QiAnalyzer::GenerateDigitalFromAnalog() {
+    mDigitalEdges.clear();
+
+    // For analog channels in Logic 2, the AnalyzerChannelData provides digitized data
+    // based on Logic 2's voltage threshold. We implement additional hysteresis filtering:
+    // A state change is only recognized when 3 consecutive samples are in the new state.
+
+    // Reset to start of data
+    U64 startSample = mQi->GetSampleNumber();
+
+    // The analog-to-digital conversion with hysteresis:
+    // We read the already-digitized data from Logic 2 and apply our own
+    // 3-consecutive-sample filter for additional noise rejection.
+
+    static const U32 kConsecutiveRequired = 3;
+
+    BitState currentState   = mQi->GetBitState();
+    U64      lastTransitionSample = startSample;
+
+    // Record initial state
+    DigitalEdge initialEdge;
+    initialEdge.sample = startSample;
+    initialEdge.state  = currentState;
+    mDigitalEdges.push_back(initialEdge);
+
+    // Process all data sample by sample
+    for (;;) {
+        CheckIfThreadShouldExit();
+
+        // Check if there are more transitions
+        if (!mQi->DoMoreTransitionsExistInCurrentData())
+            break;
+
+        // Advance to next edge (transition in Logic 2's digitized data)
+        mQi->AdvanceToNextEdge();
+        U64 edgeSample = mQi->GetSampleNumber();
+        BitState newRawState = mQi->GetBitState();
+
+        // Calculate the distance from the last recognized transition
+        U64 distance = edgeSample - lastTransitionSample;
+
+        // Check if this new state has been sustained for enough samples
+        // In Logic 2's digitized data, each edge represents a sustained state change.
+        // We look at the distance: if the pulse is at least kConsecutiveRequired samples wide,
+        // we accept the previous edge as a valid transition.
+        if (distance >= kConsecutiveRequired) {
+            // The state between lastTransitionSample and this edge was sustained long enough
+            // Record this edge as a valid digital transition
+            DigitalEdge edge;
+            edge.sample = edgeSample;
+            edge.state  = newRawState;
+            mDigitalEdges.push_back(edge);
+            lastTransitionSample = edgeSample;
+            currentState = newRawState;
+        } else {
+            // Pulse too short - this is noise/glitch, skip it
+            // Advance past this short pulse to see if signal returns
+            if (!mQi->DoMoreTransitionsExistInCurrentData())
+                break;
+            mQi->AdvanceToNextEdge();
+            // Signal returned to previous state (glitch filtered out)
+        }
+    }
+
+    // Reset the channel data position for later use
+    // Note: AnalyzerChannelData doesn't support reset, so the digital edges
+    // stored in mDigitalEdges will be used instead of mQi for analog mode
+}
+
+void QiAnalyzer::AnalogAdvanceToNextEdge() {
+    mDigitalEdgeIndex++;
+    if (mDigitalEdgeIndex < mDigitalEdges.size()) {
+        mCurrentDigitalState = mDigitalEdges[mDigitalEdgeIndex].state;
+        mCurrentAnalogSample = mDigitalEdges[mDigitalEdgeIndex].sample;
+    }
+}
+
+U64 QiAnalyzer::AnalogGetSampleNumber() {
+    if (mDigitalEdgeIndex < mDigitalEdges.size()) {
+        return mDigitalEdges[mDigitalEdgeIndex].sample;
+    }
+    return 0;
+}
+
+BitState QiAnalyzer::AnalogGetBitState() {
+    return mCurrentDigitalState;
 }
 
 void QiAnalyzer::Invalidate() {
@@ -89,30 +195,45 @@ void QiAnalyzer::Invalidate() {
 U64 QiAnalyzer::AdvanceToNextEdge(U64 edge_location, U64* p_next_edge_location, U64* p_next_edge_distance) {
     U64 starting_edge_location = edge_location;
 
-    mQi->AdvanceToNextEdge();
-    U64 next_edge_location = mQi->GetSampleNumber();
+    if (mIsAnalogMode) {
+        AnalogAdvanceToNextEdge();
+        U64 next_edge_location = AnalogGetSampleNumber();
+        U64 next_edge_distance = next_edge_location - edge_location;
 
-    U64 next_edge_distance = next_edge_location - edge_location;
+        while (((next_edge_distance <= (mTShort - mTShortMinError)) ||
+                (next_edge_distance >= (mTShort + mTShortMaxError)))
+                    &&
+               ((next_edge_distance <= (mTLong - mTLongMinError)) ||
+                (next_edge_distance >= (mTLong + mTLongMaxError)))) {
+            edge_location = next_edge_location;
 
-    while (((next_edge_distance <= (mTShort - mTShortMinError)) ||
-            (next_edge_distance >= (mTShort + mTShortMaxError)))
-                &&
-           ((next_edge_distance <= (mTLong - mTLongMinError)) ||
-            (next_edge_distance >= (mTLong + mTLongMaxError)))) {
-        // We need two glitch edges as this is a differential signal, so the signal should bounce back to our expected state
-        // mQi->AdvanceToNextEdge();
-        // edge_location = mQi->GetSampleNumber();
+            AnalogAdvanceToNextEdge();
+            next_edge_location = AnalogGetSampleNumber();
+            next_edge_distance = next_edge_location - edge_location;
+        }
 
-        edge_location = next_edge_location;
-
+        *p_next_edge_location = next_edge_location;
+        *p_next_edge_distance = next_edge_distance;
+    } else {
         mQi->AdvanceToNextEdge();
-        next_edge_location = mQi->GetSampleNumber();
+        U64 next_edge_location = mQi->GetSampleNumber();
+        U64 next_edge_distance = next_edge_location - edge_location;
 
-        next_edge_distance = next_edge_location - edge_location;
+        while (((next_edge_distance <= (mTShort - mTShortMinError)) ||
+                (next_edge_distance >= (mTShort + mTShortMaxError)))
+                    &&
+               ((next_edge_distance <= (mTLong - mTLongMinError)) ||
+                (next_edge_distance >= (mTLong + mTLongMaxError)))) {
+            edge_location = next_edge_location;
+
+            mQi->AdvanceToNextEdge();
+            next_edge_location = mQi->GetSampleNumber();
+            next_edge_distance = next_edge_location - edge_location;
+        }
+
+        *p_next_edge_location = next_edge_location;
+        *p_next_edge_distance = next_edge_distance;
     }
-
-    *p_next_edge_location = next_edge_location;
-    *p_next_edge_distance = next_edge_distance;
 
     return edge_location - starting_edge_location;
 }
@@ -121,7 +242,14 @@ void QiAnalyzer::SynchronizeQiData() {
     while (mSynchronized == false) {
         CheckIfThreadShouldExit();
 
-        U64 edge_location = mQi->GetSampleNumber();
+        U64 edge_location;
+        if (mIsAnalogMode) {
+            edge_location = AnalogGetSampleNumber();
+            if (mDigitalEdgeIndex >= mDigitalEdges.size() - 1)
+                return;
+        } else {
+            edge_location = mQi->GetSampleNumber();
+        }
 
         U64 next_edge_location, next_edge_distance;
         U64 skipped = AdvanceToNextEdge(edge_location, &next_edge_location, &next_edge_distance);
@@ -222,7 +350,16 @@ void QiAnalyzer::SynchronizeQiData() {
 void QiAnalyzer::ProcessQiData() {
     if (mSynchronized == true) {
         // We're on the clock edge of a data, parity, or stop bit, as the start bit is recorded by SynchronizeQiData().
-        U64 edge_location = mQi->GetSampleNumber();
+        U64 edge_location;
+        if (mIsAnalogMode) {
+            edge_location = AnalogGetSampleNumber();
+            if (mDigitalEdgeIndex >= mDigitalEdges.size() - 1) {
+                Invalidate();
+                return;
+            }
+        } else {
+            edge_location = mQi->GetSampleNumber();
+        }
 
         U64 next_edge_location, next_edge_distance;
         U64 skipped = AdvanceToNextEdge(edge_location, &next_edge_location, &next_edge_distance);

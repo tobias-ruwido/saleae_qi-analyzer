@@ -2,6 +2,7 @@
 #define QI_ANALYZER_H
 
 #include <deque>
+#include <vector>
 
 #include <Analyzer.h>
 #include "QiAnalyzerResults.h"
@@ -30,6 +31,12 @@ class ANALYZER_EXPORT QiAnalyzer : public Analyzer2 {
         U32 value;
     };
 
+    // Edge info for analog-to-digital conversion
+    struct DigitalEdge {
+        U64     sample;
+        BitState state;
+    };
+
     std::unique_ptr<QiAnalyzerSettings> mSettings;
     std::unique_ptr<QiAnalyzerResults>  mResults;
     AnalyzerChannelData*                mQi;
@@ -50,12 +57,25 @@ class ANALYZER_EXPORT QiAnalyzer : public Analyzer2 {
     U32                       mPacketByteCount;
     bool                      mSynchronized;
 
+    // Analog-to-digital conversion state
+    bool                      mIsAnalogMode;
+    std::deque<DigitalEdge>   mDigitalEdges;       // Generated digital edges from analog data
+    U32                       mDigitalEdgeIndex;
+    BitState                  mCurrentDigitalState;
+    U64                       mCurrentAnalogSample;
+
   private:
     void Invalidate();
-	  U64 AdvanceToNextEdge(U64 edge_location, U64* p_next_edge_location, U64* p_next_edge_distance);
+    U64 AdvanceToNextEdge(U64 edge_location, U64* p_next_edge_location, U64* p_next_edge_distance);
     void ProcessQiData();
     void SynchronizeQiData();
     void SaveBit(U64 location_start, U64 location_end, U32 value);
+
+    // Analog processing methods
+    void GenerateDigitalFromAnalog();
+    void AnalogAdvanceToNextEdge();
+    U64  AnalogGetSampleNumber();
+    BitState AnalogGetBitState();
 };
 
 extern "C" ANALYZER_EXPORT const char* __cdecl GetAnalyzerName();
