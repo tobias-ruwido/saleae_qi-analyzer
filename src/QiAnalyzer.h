@@ -62,7 +62,6 @@ class ANALYZER_EXPORT QiAnalyzer : public Analyzer2 {
     std::deque<DigitalEdge>   mDigitalEdges;       // Generated digital edges from analog data
     U32                       mDigitalEdgeIndex;
     BitState                  mCurrentDigitalState;
-    U64                       mCurrentAnalogSample;
 
   private:
     void Invalidate();

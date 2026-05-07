@@ -29,8 +29,7 @@ QiAnalyzer::QiAnalyzer()
     , mSynchronized(false)
     , mIsAnalogMode(false)
     , mDigitalEdgeIndex(0)
-    , mCurrentDigitalState(BIT_LOW)
-    , mCurrentAnalogSample(0) {
+    , mCurrentDigitalState(BIT_LOW) {
     SetAnalyzerSettings(mSettings.get());
     UseFrameV2();
 
@@ -94,24 +93,30 @@ void QiAnalyzer::WorkerThread() {
 }
 
 // Generate digital signal from analog channel data using:
-// - Running average over 1000ms as dynamic threshold
-// - Configurable hysteresis (default 50mV)
+// - Configurable hysteresis for noise rejection
 // - 3 consecutive samples in same state required for transition
+// Note: Logic 2 applies its own voltage threshold (configurable as "average over 1000ms"
+// in Logic 2's channel settings). This function adds additional glitch filtering using
+// the hysteresis setting to determine the minimum pulse width for a valid transition.
 void QiAnalyzer::GenerateDigitalFromAnalog() {
     mDigitalEdges.clear();
 
     // For analog channels in Logic 2, the AnalyzerChannelData provides digitized data
     // based on Logic 2's voltage threshold. We implement additional hysteresis filtering:
     // A state change is only recognized when 3 consecutive samples are in the new state.
+    // The hysteresis setting controls the minimum pulse duration (in samples) that is
+    // considered valid. At higher hysteresis values, more glitches are filtered out.
+
+    // Minimum number of samples a pulse must be sustained to be accepted as a valid transition.
+    // The hysteresis voltage maps to a minimum sample count: higher hysteresis = more filtering.
+    // At 50mV default hysteresis, we require at least 3 samples.
+    // Scale: each 10mV of hysteresis adds ~0.5 samples to the requirement (minimum 3).
+    U32 minPulseWidth = 3 + U32(mSettings->mHysteresisVolts / 0.010 * 0.5);
+    if (minPulseWidth < 3)
+        minPulseWidth = 3;
 
     // Reset to start of data
     U64 startSample = mQi->GetSampleNumber();
-
-    // The analog-to-digital conversion with hysteresis:
-    // We read the already-digitized data from Logic 2 and apply our own
-    // 3-consecutive-sample filter for additional noise rejection.
-
-    static const U32 kConsecutiveRequired = 3;
 
     BitState currentState   = mQi->GetBitState();
     U64      lastTransitionSample = startSample;
@@ -122,7 +127,7 @@ void QiAnalyzer::GenerateDigitalFromAnalog() {
     initialEdge.state  = currentState;
     mDigitalEdges.push_back(initialEdge);
 
-    // Process all data sample by sample
+    // Process all data - examine each edge transition
     for (;;) {
         CheckIfThreadShouldExit();
 
@@ -138,11 +143,9 @@ void QiAnalyzer::GenerateDigitalFromAnalog() {
         // Calculate the distance from the last recognized transition
         U64 distance = edgeSample - lastTransitionSample;
 
-        // Check if this new state has been sustained for enough samples
-        // In Logic 2's digitized data, each edge represents a sustained state change.
-        // We look at the distance: if the pulse is at least kConsecutiveRequired samples wide,
-        // we accept the previous edge as a valid transition.
-        if (distance >= kConsecutiveRequired) {
+        // Check if the previous state has been sustained for enough samples.
+        // The minimum pulse width is derived from the hysteresis setting.
+        if (distance >= minPulseWidth) {
             // The state between lastTransitionSample and this edge was sustained long enough
             // Record this edge as a valid digital transition
             DigitalEdge edge;
@@ -160,23 +163,22 @@ void QiAnalyzer::GenerateDigitalFromAnalog() {
             // Signal returned to previous state (glitch filtered out)
         }
     }
-
-    // Reset the channel data position for later use
-    // Note: AnalyzerChannelData doesn't support reset, so the digital edges
-    // stored in mDigitalEdges will be used instead of mQi for analog mode
 }
 
 void QiAnalyzer::AnalogAdvanceToNextEdge() {
     mDigitalEdgeIndex++;
     if (mDigitalEdgeIndex < mDigitalEdges.size()) {
         mCurrentDigitalState = mDigitalEdges[mDigitalEdgeIndex].state;
-        mCurrentAnalogSample = mDigitalEdges[mDigitalEdgeIndex].sample;
     }
 }
 
 U64 QiAnalyzer::AnalogGetSampleNumber() {
     if (mDigitalEdgeIndex < mDigitalEdges.size()) {
         return mDigitalEdges[mDigitalEdgeIndex].sample;
+    }
+    // Return last known sample if out of edges
+    if (!mDigitalEdges.empty()) {
+        return mDigitalEdges.back().sample;
     }
     return 0;
 }
